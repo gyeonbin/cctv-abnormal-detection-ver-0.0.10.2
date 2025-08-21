@@ -1,12 +1,20 @@
 # core/bus.py
 import queue
 from dataclasses import dataclass
+from typing import Tuple, Any
+from core.types import FrameMeta, InferOut
 
 @dataclass
 class Bus:
-    meta_q: queue.Queue       # FrameMeta (디코더 → 배처)
-    infer_out_q: queue.Queue  # (stream_id, fid, pts, img_src, img_yolo, scales, dets, confs)
-    track_out_q: queue.Queue  # (stream_id, fid, pts, img_src, tags)
+    """
+    파이프라인 단계 간 데이터 전송을 위한 중앙 큐 허브.
+    - meta_q: 디코더 -> 배처 (프레임 메타데이터)
+    - infer_out_q: 배처 -> 트래커 (추론 결과 객체)
+    - track_out_q: 트래커 -> 렌더러 (시각화용 태그 포함 최종 결과)
+    """
+    meta_q: queue.Queue[FrameMeta]
+    infer_out_q: queue.Queue[InferOut]
+    track_out_q: queue.Queue[Tuple[str, int, float, Any, list]] # (sid, fid, pts, img, tags)
 
 _bus = None
 
