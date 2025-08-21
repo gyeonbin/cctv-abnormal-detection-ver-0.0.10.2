@@ -1,216 +1,144 @@
 # -*- coding: utf-8 -*-
 # core/batcher.py
-# YOLO 배치 추론 스레드: InMemoryCsvLoggerNP 로깅 + 지연 한계 기반 배치 + 백프레셔 안전
+#
+# - meta_q에서 FrameMeta를 읽어 SHM 링버퍼에서 프레임을 취득
+# - YOLOv8 추론 실행 (predict)
+# - 결과를 InferOut 객체로 패키징하여 infer_out_q로 전송
+#
+# 리팩터링 핵심: 튜플 대신 InferOut 객체를 사용해 파이프라인 일관성 확보
 
 import os
 import time
 import queue
 from threading import Thread
-from typing import List, Tuple
 
 import numpy as np
-import cv2
 import torch
 from ultralytics import YOLO
 
 from core.types import FrameMeta, InferOut
-from cfg.defaults import BATCH_SIZE, MAX_BATCH_DELAY_MS, YOLO_MAX_SIDE, PRINT_EVERY
+from core.routing import get_routing
 from utils.inmem_logger import InMemoryCsvLoggerNP
 
 
 class InferenceBatcher(Thread):
-    """
-    meta_q(FrameMeta) → SharedFrameRing 읽어 배치 구성 → YOLO 추론 → InferOut을 out_q로 전달.
-    각 결과 프레임에 대해 (t_wall, fid, pts, seq=fid) 로깅을 수행하고 종료 시 CSV로 저장.
-    """
-
-    def __init__(
-        self,
-        stream_id: str,
-        ring,
-        meta_q,
-        out_q,
-        weights_path: str = "yolov8n.pt",
-        classes: Tuple[int, ...] = (0,),
-        conf: float = 0.4,
-        iou: float = 0.5,
-        device: str = None,
-        use_half: bool = True,
-        stop_event=None,
-    ):
+    def __init__(self, in_q, out_q, model_path: str, timer=None, stop_event=None):
         super().__init__(daemon=True)
-        self.stream_id = stream_id
-        self.ring = ring
-        self.meta_q = meta_q
+        self.in_q = in_q
         self.out_q = out_q
         self.stop_event = stop_event
+        self.model_path = model_path
+        self.timer = timer
+        self._stop_flag = False
 
-        self.classes = tuple(classes)
-        self.conf = float(conf)
-        self.iou = float(iou)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.use_half = bool(use_half and ("cuda" in str(self.device)))
-
-        # --- YOLO 모델 로드 ---
-        self.model = YOLO(weights_path)
+        # --- YOLO 모델 초기화 ---
         try:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.model = YOLO(self.model_path)
             self.model.to(self.device)
-            if self.use_half:
-                # 일부 백엔드에서만 유효
-                try:
-                    self.model.model.half()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            print(f"Ultralytics YOLOv8.1.25 🚀 Python-{torch.__version__} {self.device}")
+            # 첫 추론은 시간이 걸리므로 워밍업
+            self.model.predict(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+        except Exception as e:
+            print(f"[YOLO] 모델 로딩 실패: {e}")
+            self.model = None
 
-        # --- 로거 ---
-        audit_dir = os.getenv("AUDIT_DIR", "./audit")
-        os.makedirs(audit_dir, exist_ok=True)
-        self._csv_path = os.path.join(audit_dir, f"{stream_id}_yolo.csv")
-        self._log = InMemoryCsvLoggerNP(header=["t_wall", "fid", "pts", "seq"], initial_capacity=200_000)
+        # --- 인메모리 로거 ---
+        self._stream_id = None  # 첫 프레임에서 확인
+        self._log = None
 
-        # --- 상태 ---
         self._processed = 0
         self._t0 = time.time()
 
-    # ------------------------
-    # 전처리: 한 변 상한 유지 리사이즈 (aspect 유지)
-    # ------------------------
-    @staticmethod
-    def _resize_keep_max_side(img, max_side: int):
-        h, w = img.shape[:2]
-        scale = min(max_side / float(max(h, w)), 1.0)
-        if scale < 1.0:
-            new_w = max(1, int(round(w * scale)))
-            new_h = max(1, int(round(h * scale)))
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        return img
+    def _get_logger(self, sid: str) -> InMemoryCsvLoggerNP:
+        if self._log is None:
+            self._stream_id = sid
+            audit_dir = os.getenv("AUDIT_DIR", "./audit")
+            os.makedirs(audit_dir, exist_ok=True)
+            csv_path = os.path.join(audit_dir, f"{sid}_yolo.csv")
+            self._log = InMemoryCsvLoggerNP(
+                header=["t_wall", "fid", "pts", "n_dets"],
+                initial_capacity=200_000,
+                dump_path=csv_path
+            )
+        return self._log
 
-    def _pop_until_batch(self, batch_imgs: List[np.ndarray], batch_meta: List[FrameMeta]):
-        """MAX_BATCH_DELAY_MS 지연 한계 내에서 배치를 채움."""
-        start = time.time()
-        while (len(batch_imgs) < BATCH_SIZE) and ((time.time() - start) * 1000.0 < MAX_BATCH_DELAY_MS):
-            if self.stop_event is not None and self.stop_event.is_set():
-                break
-            try:
-                m = self.meta_q.get(timeout=0.003)
-                if not isinstance(m, FrameMeta):
-                    continue
-                img = self.ring.read_copy(m.slot)
-                img = self._resize_keep_max_side(img, YOLO_MAX_SIDE)
-                batch_imgs.append(img)
-                batch_meta.append(m)
-            except queue.Empty:
-                continue
-
-    def _do_infer(self, imgs: List[np.ndarray]):
-        # 울트라리틱스는 list[np.ndarray] 입력을 지원.
-        # classes/conf/iou 적용. verbose=False로 오버헤드 최소화.
-        results = self.model(
-            imgs,
-            device=self.device,
-            classes=list(self.classes) if self.classes else None,
-            conf=self.conf,
-            iou=self.iou,
-            verbose=False,
-        )
-        # 필요 시 동기화(디버그/정밀 측정용)
-        if "cuda" in str(self.device) and torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-        return results
+    def stop(self):
+        self._stop_flag = True
 
     def run(self):
-        batch_imgs: List[np.ndarray] = []
-        batch_meta: List[FrameMeta] = []
+        if self.model is None:
+            return
 
         try:
-            # 간단한 워밍업(선택)
-            try:
-                dummy = np.zeros((320, 320, 3), dtype=np.uint8)
-                _ = self._do_infer([dummy])
-            except Exception:
-                pass
-
-            while True:
-                if self.stop_event is not None and self.stop_event.is_set():
-                    break
-
-                # 먼저 1개는 블록킹으로 확보해 배치 시동
+            while not (self._stop_flag or (self.stop_event and self.stop_event.is_set())):
                 try:
-                    m0 = self.meta_q.get(timeout=0.05)
-                    if not isinstance(m0, FrameMeta):
-                        continue
-                    img0 = self.ring.read_copy(m0.slot)
-                    img0 = self._resize_keep_max_side(img0, YOLO_MAX_SIDE)
-                    batch_imgs = [img0]
-                    batch_meta = [m0]
+                    meta: FrameMeta = self.in_q.get(timeout=1.0)
                 except queue.Empty:
-                    # 입력이 잠시 없는 경우
                     continue
 
-                # 지연 한계 내 추가 수집
-                self._pop_until_batch(batch_imgs, batch_meta)
+                sid, slot, fid, pts = meta
 
-                # 추론
+                # --- 공유 메모리에서 이미지 읽기 ---
+                img_bgr = None
                 try:
-                    results = self._do_infer(batch_imgs)
+                    ring = get_routing().get_ring(sid)
+                    if ring:
+                        img_bgr = ring.read_copy(slot)
                 except Exception as e:
-                    print(f"[ERROR][YOLO:{self.stream_id}] infer failed: {e}")
+                    print(f"[BATCHER] 링버퍼 읽기 실패 (fid={fid}): {e}")
                     continue
 
-                # 결과 파싱 및 전송/로깅
-                for m, r in zip(batch_meta, results):
-                    det = getattr(r, "boxes", None)
-                    if det is None:
-                        det_xyxy = np.zeros((0, 4), dtype=np.float32)
-                        det_conf = np.zeros((0,), dtype=np.float32)
-                        det_cls = np.zeros((0,), dtype=np.float32)
-                    else:
-                        # tensor → numpy (안전 변환)
-                        def _to_np(x, shape=None, dtype=np.float32):
-                            try:
-                                arr = x.detach().cpu().numpy()
-                            except Exception:
-                                arr = np.asarray(x)
-                            if dtype is not None:
-                                arr = arr.astype(dtype, copy=False)
-                            if shape is not None and arr.size == 0:
-                                return np.zeros(shape, dtype=dtype)
-                            return arr
+                if img_bgr is None:
+                    continue
 
-                        det_xyxy = _to_np(getattr(det, "xyxy", None), shape=(0, 4)) if hasattr(det, "xyxy") else np.zeros((0, 4), dtype=np.float32)
-                        det_conf = _to_np(getattr(det, "conf", None), shape=(0,)) if hasattr(det, "conf") else np.zeros((0,), dtype=np.float32)
-                        det_cls  = _to_np(getattr(det, "cls", None),  shape=(0,)) if hasattr(det, "cls")  else np.zeros((0,), dtype=np.float32)
+                # --- YOLO 추론 ---
+                try:
+                    # verbose=False로 설정하여 콘솔 로그 최소화
+                    results = self.model.predict(img_bgr, classes=[0], verbose=False)
+                    res = results[0]  # 첫 번째 결과 사용
 
-                    # 결과 전달 (백프레셔: 기본 block=True)
-                    self.out_q.put(InferOut(
-                        stream_id=m.stream_id,
-                        fid=m.fid,
-                        pts=m.pts,
-                        det_xyxy=det_xyxy,
-                        det_conf=det_conf,
-                        det_cls=det_cls,
-                    ), block=True)
+                    # numpy로 변환
+                    det_xyxy = res.boxes.xyxy.cpu().numpy()
+                    det_conf = res.boxes.conf.cpu().numpy()
+                    det_cls = res.boxes.cls.cpu().numpy()
+                    n_dets = len(det_xyxy)
+                except Exception as e:
+                    print(f"[YOLO] 추론 실패 (fid={fid}): {e}")
+                    det_xyxy = np.empty((0, 4), dtype=np.float32)
+                    det_conf = np.empty((0,), dtype=np.float32)
+                    det_cls = np.empty((0,), dtype=np.float32)
+                    n_dets = 0
 
-                    # 로깅
-                    self._log.row((time.time(), m.fid, m.pts, m.fid))
-                    self._processed += 1
+                # --- InferOut 객체 생성 및 전송 ---
+                infer_out = InferOut(
+                    stream_id=sid,
+                    fid=fid,
+                    pts=pts,
+                    det_xyxy=det_xyxy,
+                    det_conf=det_conf,
+                    det_cls=det_cls,
+                )
+                self.out_q.put(infer_out)
 
-                # 진행 로그
-                if self._processed and (self._processed % PRINT_EVERY == 0):
-                    dt = max(1e-6, time.time() - self._t0)
-                    fps = self._processed / dt
-                    print(f"[YOLO] batch={BATCH_SIZE} processed={self._processed} fps≈{fps:.1f}")
+                # --- 로깅 및 통계 ---
+                if self.timer:
+                    self.timer.tick()
 
-        except Exception as e:
-            print(f"[ERROR][BATCH:{self.stream_id}] {e}")
+                logger = self._get_logger(sid)
+                logger.row((time.time(), fid, pts, n_dets))
+
+                self._processed += 1
+                if self._processed % 120 == 0:
+                    dt = time.time() - self._t0
+                    fps = self._processed / max(dt, 1e-6)
+                    # print(f"[YOLO] processed={self._processed}, fps≈{fps:.1f}")
+
         finally:
-            try:
-                self._log.dump(self._csv_path)
-                print(f"[YOLO] audit saved → {self._csv_path}")
-            except Exception as e:
-                print(f"[YOLO] audit dump failed: {e}")
+            # --- 종료 시 로그 저장 ---
+            if self._log:
+                try:
+                    self._log.dump()
+                    print(f"[YOLO] audit saved → {self._log.dump_path}")
+                except Exception as e:
+                    print(f"[YOLO] audit dump failed: {e}")
