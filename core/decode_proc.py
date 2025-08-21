@@ -123,7 +123,7 @@ def decoder_process(stream_id: str, video_path: str, init_q, meta_q, stop_event,
 
                 # 통계
                 if fid % PRINT_EVERY == 0 and fid != last_print_fid:
-                    print(f"[DECODE] {stream_id} fid={fid} (EMA FPS={timer.fps:.2f})")
+                    print(f"[DECODE] {stream_id} fid={fid} (EMA FPS={timer.ema:.2f})")
                     last_print_fid = fid
                 timer.tick()
 
